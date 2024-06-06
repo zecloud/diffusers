@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict,List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -228,9 +228,11 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
         addition_time_embed_dim: Optional[int] = None,
         projection_class_embeddings_input_dim: Optional[int] = None,
         time_cond_proj_dim: Optional[int] = None,
+        high_res_fix: List[Dict] = [{"timestep": 600, "scale_factor": 0.5, "block_num": 1}],
     ):
         super().__init__()
-
+        if high_res_fix:
+            self.config.high_res_fix = sorted(high_res_fix, key=lambda x: x["timestep"], reverse=True)
         self.sample_size = sample_size
 
         # Check inputs
@@ -427,6 +429,20 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
         self.conv_out = nn.Conv2d(
             block_out_channels[0], out_channels, kernel_size=conv_out_kernel, padding=conv_out_padding
         )
+
+    @classmethod
+    def _resize(cls, sample, target=None, scale_factor=1, mode="bicubic"):
+        dtype = sample.dtype
+        if dtype == torch.bfloat16:
+            sample = sample.to(torch.float32)
+
+        if target is not None:
+            if sample.shape[-2:] != target.shape[-2:]:
+                sample = nn.functional.interpolate(sample, size=target.shape[-2:], mode=mode, align_corners=False)
+        elif scale_factor != 1:
+            sample = nn.functional.interpolate(sample, scale_factor=scale_factor, mode=mode, align_corners=False)
+
+        return sample.to(dtype)
 
     @classmethod
     def from_unet2d(
@@ -950,7 +966,7 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
 
         # 3. down
         down_block_res_samples = (sample,)
-        for downsample_block in self.down_blocks:
+        for down_i, downsample_block in enumerate(self.down_blocks):
             if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
                 sample, res_samples = downsample_block(
                     hidden_states=sample,
@@ -964,6 +980,13 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb, num_frames=num_frames)
 
             down_block_res_samples += res_samples
+
+             # kohya high res fix
+            if self.config.high_res_fix:
+                for high_res_fix in self.config.high_res_fix:
+                    if timestep > high_res_fix["timestep"] and down_i == high_res_fix["block_num"]:
+                        sample = self.__class__._resize(sample, scale_factor=high_res_fix["scale_factor"])
+                        break
 
         if down_block_additional_residuals is not None:
             new_down_block_res_samples = ()
@@ -1007,6 +1030,14 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
             res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
             down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
 
+            # up scaling of kohya high res fix
+            if self.config.high_res_fix is not None:
+                if res_samples[0].shape[-2:] != sample.shape[-2:]:
+                    sample = self.__class__._resize(sample, target=res_samples[0])
+                    res_samples_up_sampled = (res_samples[0],)
+                    for res_sample in res_samples[1:]:
+                        res_samples_up_sampled += (self.__class__._resize(res_sample, target=res_samples[0]),)
+                    res_samples = res_samples_up_sampled
             # if we have not reached the final block and need to forward the
             # upsample size, we do it here
             if not is_final_block and forward_upsample_size:
