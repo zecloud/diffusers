@@ -222,11 +222,9 @@ class UNet2DConditionModel(
         mid_block_only_cross_attention: Optional[bool] = None,
         cross_attention_norm: Optional[str] = None,
         addition_embed_type_num_heads: int = 64,
-        high_res_fix: List[Dict] = [{"timestep": 600, "scale_factor": 0.5, "block_num": 1}],
     ):
         super().__init__()
-        if high_res_fix:
-            self.config.high_res_fix = sorted(high_res_fix, key=lambda x: x["timestep"], reverse=True)
+
         self.sample_size = sample_size
 
         if num_attention_heads is not None:
@@ -484,20 +482,6 @@ class UNet2DConditionModel(
         )
 
         self._set_pos_net_if_use_gligen(attention_type=attention_type, cross_attention_dim=cross_attention_dim)
-
-    @classmethod
-    def _resize(cls, sample, target=None, scale_factor=1, mode="bicubic"):
-        dtype = sample.dtype
-        if dtype == torch.bfloat16:
-            sample = sample.to(torch.float32)
-
-        if target is not None:
-            if sample.shape[-2:] != target.shape[-2:]:
-                sample = nn.functional.interpolate(sample, size=target.shape[-2:], mode=mode, align_corners=False)
-        elif scale_factor != 1:
-            sample = nn.functional.interpolate(sample, scale_factor=scale_factor, mode=mode, align_corners=False)
-
-        return sample.to(dtype)
 
     def _check_config(
         self,
@@ -1047,7 +1031,7 @@ class UNet2DConditionModel(
 
     def forward(
         self,
-        sample: torch.FloatTensor,
+        sample: torch.Tensor,
         timestep: Union[torch.Tensor, float, int],
         encoder_hidden_states: torch.Tensor,
         class_labels: Optional[torch.Tensor] = None,
@@ -1065,7 +1049,7 @@ class UNet2DConditionModel(
         The [`UNet2DConditionModel`] forward method.
 
         Args:
-            sample (`torch.FloatTensor`):
+            sample (`torch.Tensor`):
                 The noisy input tensor with the following shape `(batch, channel, height, width)`.
             timestep (`torch.Tensor` or `float` or `int`): The number of timesteps to denoise an input.
             encoder_hidden_states (`torch.Tensor`):
@@ -1215,7 +1199,7 @@ class UNet2DConditionModel(
             is_adapter = True
 
         down_block_res_samples = (sample,)
-        for down_i, downsample_block in enumerate(self.down_blocks):
+        for downsample_block in self.down_blocks:
             if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
                 # For t2i-adapter CrossAttnDownBlock2D
                 additional_residuals = {}
@@ -1237,13 +1221,6 @@ class UNet2DConditionModel(
                     sample += down_intrablock_additional_residuals.pop(0)
 
             down_block_res_samples += res_samples
-
-            # kohya high res fix
-            if self.config.high_res_fix:
-                for high_res_fix in self.config.high_res_fix:
-                    if timestep > high_res_fix["timestep"] and down_i == high_res_fix["block_num"]:
-                        sample = self.__class__._resize(sample, scale_factor=high_res_fix["scale_factor"])
-                        break
 
         if is_controlnet:
             new_down_block_res_samples = ()
@@ -1288,15 +1265,6 @@ class UNet2DConditionModel(
             res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
             down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
 
-            # up scaling of kohya high res fix
-            if self.config.high_res_fix is not None:
-                if res_samples[0].shape[-2:] != sample.shape[-2:]:
-                    sample = self.__class__._resize(sample, target=res_samples[0])
-                    res_samples_up_sampled = (res_samples[0],)
-                    for res_sample in res_samples[1:]:
-                        res_samples_up_sampled += (self.__class__._resize(res_sample, target=res_samples[0]),)
-                    res_samples = res_samples_up_sampled
-                    
             # if we have not reached the final block and need to forward the
             # upsample size, we do it here
             if not is_final_block and forward_upsample_size:
